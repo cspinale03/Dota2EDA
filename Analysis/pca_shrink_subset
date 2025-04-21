@@ -1,0 +1,145 @@
+---
+title: "pca_shrink_subset"
+author: "Cole Spinale"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(leaps)
+library(glmnet)
+library(tidyverse)
+```
+
+```{r}
+df <- read.csv("df_sample.csv")
+```
+
+```{r}
+df <- df %>% select(-c("match_id", "leagueid", "radiant_team_id", "dire_team_id", "region"))
+```
+
+
+```{r}
+set.seed(01002)
+train_idx <- sample(1:nrow(df), size = 0.9 * nrow(df))
+train_df <- df[train_idx, ]
+test_df <- df[-train_idx, ]
+```
+
+
+BEST SUBSET SELECTION (w match_id)
+
+```{r}
+subset_fit <- regsubsets(duration ~ ., data = train_df, nvmax = 10)
+subset_summary <- summary(subset_fit)
+
+test_mat <- model.matrix(duration ~ ., data = test_df)
+
+val_errors <- rep(NA, 10)
+for (i in 1:10) {
+  coef_i <- coef(subset_fit, id = i)
+  pred <- test_mat[, names(coef_i)] %*% coef_i
+  val_errors[i] <- mean((test_df$duration - pred)^2)
+}
+
+plot(val_errors, type = "b", xlab = "Number of Predictors", ylab = "Test MSE",
+     main = "Best Subset Selection: Test MSE")
+```
+
+```{r}
+coef_5 <- coef(subset_fit, id = 6)
+names(coef_5)[-1]
+```
+
+
+
+Shrinkage (RIDGE/LASSO)
+
+```{r}
+# here i continue to remove match_id as it likely is non-informative to duration
+X_train <- model.matrix(duration ~ . -1, data = train_df)
+y_train <- train_df$duration
+X_test  <- model.matrix(duration ~ . -1, data = test_df)
+y_test <- test_df$duration
+
+
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1)
+lasso_pred <- predict(cv_lasso, newx = X_test, s = "lambda.min")
+lasso_mse <- mean((y_test - lasso_pred)^2)
+lasso_mse
+```
+
+```{r}
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+lasso_predictors <- rownames(lasso_coef)[lasso_coef[, 1] != 0]
+lasso_predictors <- setdiff(lasso_predictors, "(Intercept)")
+lasso_predictors
+```
+
+The Lasso model kept 24 predictors at optimal lambda. Because of how many predictors were retained this suggests that game duration is influenced by many factors, although some minimally so. 
+
+PCA
+
+```{r}
+# get only numeric and remove duration
+num_cols <- sapply(df, is.numeric)
+df_num <- df[, num_cols]
+df_num$duration <- NULL  
+
+# remove cols with variance = 0 
+X_train_raw <- train_df[, colnames(df_num)]
+nzv_cols <- apply(X_train_raw, 2, var) > 0
+X_train <- scale(X_train_raw[, nzv_cols])
+
+# scale predictors for pca
+X_test_raw <- test_df[, colnames(X_train_raw[, nzv_cols])]
+X_test <- scale(X_test_raw,
+                center = attr(X_train, "scaled:center"),
+                scale = attr(X_train, "scaled:scale"))
+
+pca_train <- prcomp(X_train)
+
+plot(pca_train, type = "l", main = "Plot of Principal Components")
+summary(pca_train)
+
+```
+It appears that PC's 1 and 2 explain the majority of the variance in the data. 
+
+
+```{r}
+# train w top 5 PCs
+train_pca_df <- as.data.frame(pca_train$x[, 1:5])
+train_pca_df$duration <- train_df$duration
+
+pca_model <- lm(duration ~ ., data = train_pca_df)
+summary(pca_model)
+```
+
+
+```{r}
+test_pcs <- predict(pca_train, newdata = X_test)[, 1:5]
+test_pca_df <- as.data.frame(test_pcs)
+
+pca_pred <- predict(pca_model, newdata = test_pca_df)
+test_mse_pca <- mean((test_df$duration - pca_pred)^2)
+test_mse_pca
+```
+
+```{r}
+pca_loadings <- pca_train$rotation[, 1:5]
+top_contributors <- apply(pca_loadings, 2, function(pc) {
+  names(sort(abs(pc), decreasing = TRUE)[1:5])
+})
+top_contributors
+
+```
+PC1: Comprised of variables that represent match intensity/team performance
+PC2: comprised of team composition variables (through hero bans)
+PC3: comprised of match metadata (match_id, league_id) as well as team hero picks (radiant)
+PC4: comprised of a combination of resources/score/team composition (dire)
+PC5: comprised of universal picks and hero qualities
